@@ -135,9 +135,46 @@ NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
 ENGINEERED_DENSE_FID = 100000
 TIME_WINDOW_SECONDS = (3600, 6 * 3600, 86400, 3 * 86400, 7 * 86400, 30 * 86400)
-RECENT_PAIR_STEPS = 50
-DEFAULT_ENGINEERED_FEATURE_GROUPS = ('time', 'item')
+DEFAULT_PAIR_RECENT_STEPS = 20
+DEFAULT_PAIR_SEQ_FIDS = 'seq_a:38,seq_b:69,seq_c:47,seq_d:23'
+DEFAULT_PAIR_CANDIDATE_FIDS = 'item_id,11'
+DEFAULT_ENGINEERED_FEATURE_GROUPS = ('time', 'pair')
 VALID_ENGINEERED_FEATURE_GROUPS = {'time', 'item', 'pair'}
+RAW_DENSE_PRETRAIN_FIDS = {61, 87}
+RAW_DENSE_STAT_FIDS = {62, 63, 64, 65, 66, 89, 90, 91}
+
+
+def parse_pair_seq_fids(value: Optional[Any]) -> Dict[str, List[int]]:
+    if value is None:
+        value = DEFAULT_PAIR_SEQ_FIDS
+    if isinstance(value, dict):
+        return {
+            str(domain).strip(): [int(fid) for fid in fids]
+            for domain, fids in value.items()
+        }
+    result: Dict[str, List[int]] = {}
+    for part in str(value).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        domain, fids_str = part.split(':', 1)
+        result[domain.strip()] = [
+            int(fid.strip()) for fid in fids_str.replace('|', ';').split(';')
+            if fid.strip()
+        ]
+    return result
+
+
+def parse_pair_candidate_fids(value: Optional[Any]) -> Tuple[bool, List[int]]:
+    if value is None:
+        value = DEFAULT_PAIR_CANDIDATE_FIDS
+    if isinstance(value, (list, tuple, set)):
+        values = [str(v).strip().lower() for v in value if str(v).strip()]
+    else:
+        values = [v.strip().lower() for v in str(value).split(',') if v.strip()]
+    use_item_id = 'item_id' in values
+    item_fids = [int(v) for v in values if v != 'item_id']
+    return use_item_id, item_fids
 
 
 def normalize_engineered_feature_groups(groups: Optional[Any]) -> Tuple[str, ...]:
@@ -325,6 +362,9 @@ class PCVRParquetDataset(IterableDataset):
         feature_stats: Optional[Dict[str, Any]] = None,
         stats_leave_one_out: bool = False,
         engineered_feature_groups: Optional[Any] = None,
+        pair_recent_steps: int = DEFAULT_PAIR_RECENT_STEPS,
+        pair_seq_fids: Optional[Any] = None,
+        pair_candidate_fids: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -348,7 +388,14 @@ class PCVRParquetDataset(IterableDataset):
             stats_leave_one_out: Remove the current row's label contribution
                 when looking up train-built target statistics.
             engineered_feature_groups: Enabled engineered feature families.
-                Defaults to ``time,item``; ``pair`` is heavier and opt-in.
+                Defaults to ``time,pair``. ``item`` target-stat features are
+                opt-in because they can overfit hidden-test distributions.
+            pair_recent_steps: Number of recent sequence steps used by pair
+                matching.
+            pair_seq_fids: Sequence fid whitelist, e.g.
+                ``seq_a:38,seq_b:69``.
+            pair_candidate_fids: Candidate-side ids used by pair matching,
+                e.g. ``item_id,11``.
         """
         super().__init__()
 
@@ -371,6 +418,10 @@ class PCVRParquetDataset(IterableDataset):
         self.stats_leave_one_out = stats_leave_one_out
         self.engineered_feature_groups = normalize_engineered_feature_groups(
             engineered_feature_groups)
+        self.pair_recent_steps = max(1, int(pair_recent_steps))
+        self.pair_seq_fids = parse_pair_seq_fids(pair_seq_fids)
+        self.pair_use_item_id, self.pair_candidate_item_fids = parse_pair_candidate_fids(
+            pair_candidate_fids)
         self.feature_stats = feature_stats or {}
         self._stat_prior = float(self.feature_stats.get('prior', 0.0))
         self._stat_smoothing = float(self.feature_stats.get('smoothing', 20.0))
@@ -400,6 +451,7 @@ class PCVRParquetDataset(IterableDataset):
         if self.enable_engineered_features:
             self.engineered_dense_feature_names = self._build_engineered_dense_feature_names()
             self.user_dense_schema.add(ENGINEERED_DENSE_FID, len(self.engineered_dense_feature_names))
+        self.user_dense_group_indices = self._build_user_dense_group_indices()
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -535,6 +587,7 @@ class PCVRParquetDataset(IterableDataset):
                     f'{domain}_mean_gap_log',
                     f'{domain}_min_gap_log',
                     f'{domain}_max_gap_log',
+                    f'{domain}_has_history',
                 ])
                 names.extend([f'{domain}_cnt_{w}s_log' for w in TIME_WINDOW_SECONDS])
             names.extend([
@@ -542,6 +595,9 @@ class PCVRParquetDataset(IterableDataset):
                 'sample_hour_cos',
                 'sample_dow_sin',
                 'sample_dow_cos',
+                'sample_is_weekend',
+                'sample_is_late_23_0_1',
+                'sample_is_weekend_late',
             ])
         if 'item' in self.engineered_feature_groups:
             names.extend([
@@ -557,13 +613,74 @@ class PCVRParquetDataset(IterableDataset):
                 ])
         if 'pair' in self.engineered_feature_groups:
             for domain in self.seq_domains:
-                for fid in self.sideinfo_fids[domain]:
+                for fid in self._effective_pair_fids(domain):
                     names.extend([
                         f'pair_{domain}_{fid}_hit',
                         f'pair_{domain}_{fid}_hit_count_log',
                         f'pair_{domain}_{fid}_recency_log',
                     ])
         return names
+
+    def _effective_pair_fids(self, domain: str) -> List[int]:
+        wanted = self.pair_seq_fids.get(domain, [])
+        valid = set(self.sideinfo_fids.get(domain, []))
+        return [fid for fid in wanted if fid in valid]
+
+    def _build_user_dense_group_indices(self) -> Dict[str, List[int]]:
+        groups: Dict[str, List[int]] = {
+            'pretrain_dense': [],
+            'stat_dense': [],
+            'other_dense': [],
+        }
+        for fid, offset, length in self.user_dense_schema.entries:
+            if fid == ENGINEERED_DENSE_FID:
+                continue
+            indices = list(range(offset, offset + length))
+            if fid in RAW_DENSE_PRETRAIN_FIDS:
+                groups['pretrain_dense'].extend(indices)
+            elif fid in RAW_DENSE_STAT_FIDS:
+                groups['stat_dense'].extend(indices)
+            else:
+                groups['other_dense'].extend(indices)
+
+        result: Dict[str, List[int]] = {
+            group_name: indices for group_name, indices in groups.items() if indices
+        }
+
+        engineered_offset = self.user_dense_schema.total_dim - len(self.engineered_dense_feature_names)
+        cursor = engineered_offset
+        for group_name in self.engineered_feature_groups:
+            if group_name == 'time':
+                dim = self._engineered_time_dim()
+                output_name = 'time_engineered'
+            elif group_name == 'item':
+                dim = self._engineered_item_dim()
+                output_name = 'item_engineered'
+            elif group_name == 'pair':
+                dim = self._engineered_pair_dim()
+                output_name = 'pair_engineered'
+            else:
+                dim = 0
+                output_name = group_name
+            if dim > 0:
+                result[output_name] = list(range(cursor, cursor + dim))
+                cursor += dim
+        return result
+
+    def _engineered_time_dim(self) -> int:
+        if 'time' not in self.engineered_feature_groups:
+            return 0
+        return len(self.seq_domains) * (7 + len(TIME_WINDOW_SECONDS)) + 7
+
+    def _engineered_item_dim(self) -> int:
+        if 'item' not in self.engineered_feature_groups:
+            return 0
+        return 3 + 3 * len(self._item_int_cols)
+
+    def _engineered_pair_dim(self) -> int:
+        if 'pair' not in self.engineered_feature_groups:
+            return 0
+        return 3 * sum(len(self._effective_pair_fids(domain)) for domain in self.seq_domains)
 
     def _compute_time_dense_features(
         self,
@@ -580,11 +697,11 @@ class PCVRParquetDataset(IterableDataset):
             seq_lens = seq_lens_by_domain[domain].astype(np.float64)
             feats.append(_log_norm(seq_lens, 4096.0))
             if seq_ts is None or seq_ts.shape[1] == 0:
-                feats.extend([np.zeros(B, dtype=np.float32) for _ in range(5 + len(TIME_WINDOW_SECONDS))])
+                feats.extend([np.zeros(B, dtype=np.float32) for _ in range(6 + len(TIME_WINDOW_SECONDS))])
                 continue
 
-            valid = seq_ts > 0
-            time_diff = np.where(valid, np.maximum(ts_expanded - seq_ts, 0), 0)
+            valid = (seq_ts > 0) & (seq_ts <= ts_expanded)
+            time_diff = np.where(valid, ts_expanded - seq_ts, 0)
             has_valid = valid.any(axis=1)
             large = np.full_like(time_diff, 31536000 * 2)
             recency = np.where(valid, time_diff, large).min(axis=1)
@@ -614,6 +731,7 @@ class PCVRParquetDataset(IterableDataset):
                 _log_norm(gap_mean, 31536000.0),
                 _log_norm(gap_min, 31536000.0),
                 _log_norm(gap_max, 31536000.0),
+                has_valid.astype(np.float32),
             ])
             for window in TIME_WINDOW_SECONDS:
                 cnt = ((time_diff <= window) & valid).sum(axis=1).astype(np.float64)
@@ -621,11 +739,16 @@ class PCVRParquetDataset(IterableDataset):
 
         hour = ((timestamps // 3600) % 24).astype(np.float64)
         dow = ((timestamps // 86400 + 4) % 7).astype(np.float64)
+        is_weekend = np.isin(dow.astype(np.int64), [5, 6]).astype(np.float32)
+        is_late = np.isin(hour.astype(np.int64), [23, 0, 1]).astype(np.float32)
         feats.extend([
             np.sin(2.0 * np.pi * hour / 24.0).astype(np.float32),
             np.cos(2.0 * np.pi * hour / 24.0).astype(np.float32),
             np.sin(2.0 * np.pi * dow / 7.0).astype(np.float32),
             np.cos(2.0 * np.pi * dow / 7.0).astype(np.float32),
+            is_weekend,
+            is_late,
+            (is_weekend * is_late).astype(np.float32),
         ])
         return np.stack(feats, axis=1).astype(np.float32)
 
@@ -661,6 +784,8 @@ class PCVRParquetDataset(IterableDataset):
         for fid, _, _ in self._item_int_cols:
             value_stats = self._item_fid_stats.get(fid, {})
             values = item_value_by_fid.get(fid, np.zeros(B, dtype=np.int64))
+            if values.ndim > 1:
+                values = values[:, 0] if values.shape[1] > 0 else np.zeros(B, dtype=np.int64)
             count_arr = np.zeros(B, dtype=np.float64)
             pos_arr = np.zeros(B, dtype=np.float64)
             rate_arr = np.full(B, self._stat_prior, dtype=np.float32)
@@ -697,24 +822,30 @@ class PCVRParquetDataset(IterableDataset):
         feats: List["npt.NDArray[np.float32]"] = []
         for domain in self.seq_domains:
             seq_ts = seq_ts_by_domain.get(domain)
-            for fid in self.sideinfo_fids[domain]:
+            for fid in self._effective_pair_fids(domain):
                 seq_vals = seq_side_values[domain][fid]
-                item_vals = item_value_by_fid.get(fid)
                 hit = np.zeros(B, dtype=np.float32)
                 hit_count = np.zeros(B, dtype=np.float64)
                 hit_recency = np.zeros(B, dtype=np.float64)
                 for i in range(B):
-                    candidates = [int(item_ids[i])]
-                    for values in item_value_by_fid.values():
-                        value = int(values[i])
-                        if value > 0:
-                            candidates.append(value)
-                    if item_vals is not None and int(item_vals[i]) > 0:
-                        candidates.append(int(item_vals[i]))
+                    candidates: List[int] = []
+                    if self.pair_use_item_id and int(item_ids[i]) > 0:
+                        candidates.append(int(item_ids[i]))
+                    for cand_fid in self.pair_candidate_item_fids:
+                        values = item_value_by_fid.get(cand_fid)
+                        if values is None:
+                            continue
+                        row_values = values[i]
+                        if np.ndim(row_values) == 0:
+                            row_values = [int(row_values)]
+                        for value in row_values:
+                            value = int(value)
+                            if value > 0:
+                                candidates.append(value)
                     candidates = list({v for v in candidates if v > 0})
                     if not candidates:
                         continue
-                    valid_positions = np.where(np.isin(seq_vals[i, :RECENT_PAIR_STEPS], candidates))[0]
+                    valid_positions = np.where(np.isin(seq_vals[i, :self.pair_recent_steps], candidates))[0]
                     if valid_positions.shape[0] == 0:
                         continue
                     hit[i] = 1.0
@@ -726,7 +857,7 @@ class PCVRParquetDataset(IterableDataset):
                             hit_recency[i] = float(max(int(timestamps[i]) - int(matched_ts.max()), 0))
                 feats.extend([
                     hit,
-                    _log_norm(hit_count, float(RECENT_PAIR_STEPS)),
+                    _log_norm(hit_count, float(self.pair_recent_steps)),
                     _log_norm(hit_recency, 31536000.0),
                 ])
         return np.stack(feats, axis=1).astype(np.float32)
@@ -970,7 +1101,7 @@ class PCVRParquetDataset(IterableDataset):
                 else:
                     padded[:] = 0
                 item_int[:, offset:offset + dim] = padded
-                item_value_by_fid[fid] = padded[:, 0].copy() if dim > 0 else np.zeros(B, dtype=np.int64)
+                item_value_by_fid[fid] = padded.copy() if dim > 0 else np.zeros((B, 0), dtype=np.int64)
 
         # ---- user_dense ----
         user_dense = self._buf_user_dense[:B]
@@ -1124,6 +1255,9 @@ def get_pcvr_data(
     enable_engineered_features: bool = True,
     stats_smoothing: float = 20.0,
     engineered_feature_groups: Optional[Any] = None,
+    pair_recent_steps: int = DEFAULT_PAIR_RECENT_STEPS,
+    pair_seq_fids: Optional[Any] = None,
+    pair_candidate_fids: Optional[Any] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -1196,6 +1330,9 @@ def get_pcvr_data(
         feature_stats=feature_stats,
         stats_leave_one_out=True,
         engineered_feature_groups=engineered_feature_groups,
+        pair_recent_steps=pair_recent_steps,
+        pair_seq_fids=pair_seq_fids,
+        pair_candidate_fids=pair_candidate_fids,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -1222,6 +1359,9 @@ def get_pcvr_data(
         feature_stats=feature_stats,
         stats_leave_one_out=False,
         engineered_feature_groups=engineered_feature_groups,
+        pair_recent_steps=pair_recent_steps,
+        pair_seq_fids=pair_seq_fids,
+        pair_candidate_fids=pair_candidate_fids,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
@@ -1236,5 +1376,6 @@ def get_pcvr_data(
             len(train_dataset.engineered_dense_feature_names),
             ','.join(engineered_feature_groups),
         )
+        logging.info("User dense feature groups: %s", train_dataset.user_dense_group_indices)
 
     return train_loader, valid_loader, train_dataset

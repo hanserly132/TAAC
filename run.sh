@@ -11,6 +11,11 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 4 \
-    --batch_size  512\
+    --batch_size 512 \
+    --engineered_feature_groups time,pair \
+    --pair_recent_steps 20 \
+    --pair_seq_fids "seq_a:38,seq_b:69,seq_c:47,seq_d:23" \
+    --pair_candidate_fids "item_id,11" \
+    --dense_projection_mode group_fusion \
     --seq_max_lens "seq_a:512,seq_b:512,seq_c:1024,seq_d:1024" \
     "$@"

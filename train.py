@@ -92,10 +92,18 @@ def parse_args() -> argparse.Namespace:
                         help='Disable engineered dense feature construction.')
     parser.add_argument('--stats_smoothing', type=float, default=20.0,
                         help='Bayesian smoothing strength for item and item-fid target statistics.')
-    parser.add_argument('--engineered_feature_groups', type=str, default='time,item',
+    parser.add_argument('--engineered_feature_groups', type=str, default='time,pair',
                         help='Comma-separated engineered feature groups. '
-                             'Default "time,item" is efficient; add ",pair" for '
-                             'heavier sequence-candidate matching features.')
+                             'Default "time,pair" avoids target-stat overfitting; '
+                             'add "item" explicitly for train-only item target stats.')
+    parser.add_argument('--pair_recent_steps', type=int, default=20,
+                        help='Number of recent sequence positions used by pair matching.')
+    parser.add_argument('--pair_seq_fids', type=str,
+                        default='seq_a:38,seq_b:69,seq_c:47,seq_d:23',
+                        help='Whitelist sequence fids for pair matching.')
+    parser.add_argument('--pair_candidate_fids', type=str, default='item_id,11',
+                        help='Candidate-side ids for pair matching; item_id is special, '
+                             'numbers refer to item_int_feats_{fid}.')
     parser.add_argument('--compile_model', action='store_true', default=False,
                         help='Enable torch.compile for the model. Disabled by default '
                              'because inductor compilation can trigger extra GPU '
@@ -149,6 +157,11 @@ def parse_args() -> argparse.Namespace:
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
                         help='RoPE base frequency (default 10000)')
+    parser.add_argument('--dense_projection_mode', type=str, default='group_fusion',
+                        choices=['group_fusion', 'single'],
+                        help='How user_dense_feats are projected: group_fusion splits '
+                             'heterogeneous raw/time/pair/item dense groups before fusing '
+                             'to one token; single keeps the old one-layer projection.')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -281,6 +294,9 @@ def main() -> None:
         enable_engineered_features=args.use_engineered_features,
         stats_smoothing=args.stats_smoothing,
         engineered_feature_groups=args.engineered_feature_groups,
+        pair_recent_steps=args.pair_recent_steps,
+        pair_seq_fids=args.pair_seq_fids,
+        pair_candidate_fids=args.pair_candidate_fids,
     )
 
     # ---- NS groups ----
@@ -311,6 +327,7 @@ def main() -> None:
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
+        "user_dense_group_indices": pcvr_dataset.user_dense_group_indices,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
         "d_model": args.d_model,
@@ -333,6 +350,7 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "dense_projection_mode": args.dense_projection_mode,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

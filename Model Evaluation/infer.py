@@ -69,12 +69,16 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    'dense_projection_mode': 'group_fusion',
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
 _FALLBACK_BATCH_SIZE = 256
 _FALLBACK_NUM_WORKERS = 4
-_FALLBACK_ENGINEERED_FEATURE_GROUPS = 'time,item'
+_FALLBACK_ENGINEERED_FEATURE_GROUPS = 'time,pair'
+_FALLBACK_PAIR_RECENT_STEPS = 20
+_FALLBACK_PAIR_SEQ_FIDS = 'seq_a:38,seq_b:69,seq_c:47,seq_d:23'
+_FALLBACK_PAIR_CANDIDATE_FIDS = 'item_id,11'
 
 
 # Hyperparameter keys used to build the model. Everything else in
@@ -229,6 +233,7 @@ def build_model(
         user_dense_dim=dataset.user_dense_schema.total_dim,
         item_dense_dim=dataset.item_dense_schema.total_dim,
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
+        user_dense_group_indices=dataset.user_dense_group_indices,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
         **model_cfg,
@@ -417,6 +422,10 @@ def main() -> None:
     use_engineered_features = bool(train_config.get('use_engineered_features', False))
     engineered_feature_groups = train_config.get(
         'engineered_feature_groups', _FALLBACK_ENGINEERED_FEATURE_GROUPS)
+    pair_recent_steps = int(train_config.get('pair_recent_steps', _FALLBACK_PAIR_RECENT_STEPS))
+    pair_seq_fids = train_config.get('pair_seq_fids', _FALLBACK_PAIR_SEQ_FIDS)
+    pair_candidate_fids = train_config.get(
+        'pair_candidate_fids', _FALLBACK_PAIR_CANDIDATE_FIDS)
     feature_stats = load_feature_stats_for_infer(model_dir, train_config)
 
     test_dataset = PCVRParquetDataset(
@@ -431,6 +440,9 @@ def main() -> None:
         feature_stats=feature_stats,
         stats_leave_one_out=False,
         engineered_feature_groups=engineered_feature_groups,
+        pair_recent_steps=pair_recent_steps,
+        pair_seq_fids=pair_seq_fids,
+        pair_candidate_fids=pair_candidate_fids,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")

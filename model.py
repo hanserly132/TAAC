@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 # 文件顶部加 import
 from torch.utils.checkpoint import checkpoint as ckpt_fn
 
@@ -1190,6 +1190,76 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class DenseGroupFusion(nn.Module):
+    """Projects heterogeneous dense feature groups separately and fuses them.
+
+    The output remains one dense token, so the number of NS tokens and the
+    RankMixer ``d_model % T`` constraint stay unchanged.
+    """
+
+    def __init__(
+        self,
+        total_dim: int,
+        group_indices: Optional[Dict[str, List[int]]],
+        d_model: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.total_dim = int(total_dim)
+        self.group_names: List[str] = []
+        self.group_indices: Dict[str, torch.Tensor] = {}
+        self.group_projs = nn.ModuleDict()
+
+        if not group_indices:
+            group_indices = {'all_dense': list(range(total_dim))}
+
+        for name, indices in group_indices.items():
+            clean = sorted({int(i) for i in indices if 0 <= int(i) < total_dim})
+            if not clean:
+                continue
+            self.group_names.append(name)
+            self.register_buffer(
+                f'_idx_{name}',
+                torch.tensor(clean, dtype=torch.long),
+                persistent=False,
+            )
+            self.group_projs[name] = nn.Sequential(
+                nn.Linear(len(clean), d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+            )
+
+        if not self.group_names:
+            self.group_names.append('all_dense')
+            self.register_buffer(
+                '_idx_all_dense',
+                torch.arange(total_dim, dtype=torch.long),
+                persistent=False,
+            )
+            self.group_projs['all_dense'] = nn.Sequential(
+                nn.Linear(total_dim, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+            )
+
+        self.gate = nn.Linear(len(self.group_names) * d_model, len(self.group_names))
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, dense_feats: torch.Tensor) -> torch.Tensor:
+        tokens = []
+        for name in self.group_names:
+            idx = getattr(self, f'_idx_{name}').to(dense_feats.device)
+            group_x = dense_feats.index_select(dim=1, index=idx)
+            tokens.append(self.group_projs[name](group_x))
+        stacked = torch.stack(tokens, dim=1)  # (B, G, D)
+        gate_logits = self.gate(torch.cat(tokens, dim=-1))
+        gate = torch.softmax(gate_logits, dim=-1).unsqueeze(-1)
+        fused = (stacked * gate).sum(dim=1)
+        return self.out_norm(fused)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1208,6 +1278,7 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        user_dense_group_indices: Optional[Dict[str, List[int]]] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1230,6 +1301,7 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        dense_projection_mode: str = 'group_fusion',
     ) -> None:
         super().__init__()
 
@@ -1245,6 +1317,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.dense_projection_mode = dense_projection_mode
 
         # ================== NS Tokens Construction ==================
 
@@ -1299,10 +1372,20 @@ class PCVRHyFormer(nn.Module):
         # User dense feature projection (if available)
         self.has_user_dense = user_dense_dim > 0
         if self.has_user_dense:
-            self.user_dense_proj = nn.Sequential(
-                nn.Linear(user_dense_dim, d_model),
-                nn.LayerNorm(d_model),
-            )
+            if dense_projection_mode == 'group_fusion':
+                self.user_dense_proj = DenseGroupFusion(
+                    total_dim=user_dense_dim,
+                    group_indices=user_dense_group_indices,
+                    d_model=d_model,
+                    dropout=dropout_rate,
+                )
+            elif dense_projection_mode == 'single':
+                self.user_dense_proj = nn.Sequential(
+                    nn.Linear(user_dense_dim, d_model),
+                    nn.LayerNorm(d_model),
+                )
+            else:
+                raise ValueError(f"Unknown dense_projection_mode: {dense_projection_mode}")
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
@@ -1652,7 +1735,10 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            user_dense_tok = self.user_dense_proj(inputs.user_dense_feats)
+            if self.dense_projection_mode == 'single':
+                user_dense_tok = F.silu(user_dense_tok)
+            user_dense_tok = user_dense_tok.unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
@@ -1695,7 +1781,10 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            user_dense_tok = self.user_dense_proj(inputs.user_dense_feats)
+            if self.dense_projection_mode == 'single':
+                user_dense_tok = F.silu(user_dense_tok)
+            user_dense_tok = user_dense_tok.unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:

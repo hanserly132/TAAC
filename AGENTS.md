@@ -2,17 +2,18 @@
 
 ## 版本说明
 
-当前版本可视为：**baseline_v1 + 部分 feature engineering 增强版**。
+当前版本可视为：**baseline_v1 + 稳健 feature engineering v2 增强版**。
 
 本仓库最初是 TAAC2026 推荐系统/PCVR 预测任务的 baseline。当前改动重点不是重写模型结构，而是在保持 baseline 训练、推理格式兼容的前提下，增加可控的工程特征：
 
-- 默认启用序列时间特征和 item 侧统计特征：`time,item`
-- 已实现但默认关闭较重的 pair 特征：`pair`
-- 训练阶段保存 `feature_stats.pkl`
-- 推理阶段加载同一份 `feature_stats.pkl`，避免训练/推理特征语义不一致
+- 默认启用增强时间特征和语义白名单 pair 特征：`time,pair`
+- item 侧 target/stat 统计特征保留为可选实验，默认不启用
+- 启用 item 组时训练阶段保存 `feature_stats.pkl`
+- 启用 item 组时推理阶段加载同一份 `feature_stats.pkl`，避免训练/推理特征语义不一致
+- `DenseGroupFusion` 会按 raw dense、time、pair、item 组分别投影后门控融合
 - 默认关闭 `torch.compile`，规避线上平台 inductor 编译阶段 CUDA OOM 风险
 
-一句话概括：**这是一个在原 PCVRHyFormer baseline 上追加轻量 dense 工程特征，并保持线上训练/推理格式兼容的版本。**
+一句话概括：**这是一个在原 PCVRHyFormer baseline 上追加增强时间特征、语义白名单 pair 特征和异质 dense 分组投影，并保持线上训练/推理格式兼容的版本。**
 
 ## 项目目标
 
@@ -42,8 +43,12 @@
   - 重要环境变量：`TRAIN_DATA_PATH`、`TRAIN_CKPT_PATH`、`TRAIN_LOG_PATH`、`TRAIN_TF_EVENTS_PATH`。
   - 工程特征参数：
     - `--use_engineered_features` / `--no_engineered_features`
-    - `--engineered_feature_groups`，默认 `time,item`
+    - `--engineered_feature_groups`，默认 `time,pair`
     - `--stats_smoothing`，默认 `20.0`
+    - `--pair_recent_steps`，默认 `20`
+    - `--pair_seq_fids`，默认 `seq_a:38,seq_b:69,seq_c:47,seq_d:23`
+    - `--pair_candidate_fids`，默认 `item_id,11`
+    - `--dense_projection_mode`，默认 `group_fusion`
   - `--compile_model` 默认关闭；只有显式传入才启用 `torch.compile`。
 
 - `dataset.py`
@@ -59,6 +64,7 @@
     - `seq_*_len`
     - `seq_*_time_bucket`
   - 新增工程 dense 特征会追加到 `user_dense_feats` 尾部，使用内部 fid `ENGINEERED_DENSE_FID = 100000`。
+  - 同时提供 `user_dense_group_indices`，供模型按 `pretrain_dense / stat_dense / time_engineered / pair_engineered / item_engineered` 做异质分组投影。
 
 - `model.py`
   - PCVRHyFormer 模型主体。
@@ -70,6 +76,7 @@
     - MultiSeqQueryGenerator
     - MultiSeqHyFormerBlock
     - RankMixerBlock
+    - DenseGroupFusion
     - 最终 MLP 输出 logits
   - 当前默认 NS tokenizer 使用 `rankmixer`，可降低 NS token 数量，控制 `d_model % T` 约束。
 
@@ -117,8 +124,9 @@
 - 行为间隔的 mean / min / max
 - 最近 `1h / 6h / 1d / 3d / 7d / 30d` 行为计数
 - 样本 timestamp 的 hour/day 周期特征
+- 周末、深夜 `23/0/1`、周末深夜二值特征
 
-这类特征只依赖样本自身，不依赖 label，因此训练和推理都可直接计算。
+这类特征只依赖样本自身，不依赖 label，因此训练和推理都可直接计算。当前版本只用 `0 < seq_ts <= timestamp` 的历史行为计算 recency、span、gap 和窗口计数。
 
 ### 2. `item` 侧统计特征
 
@@ -129,17 +137,24 @@
 - `item_id` 平滑 CVR
 - 各 `item_int_feats_*` 取值的曝光次数、正样本次数、平滑 CVR
 
-训练样本使用 leave-one-out 调整，降低标签泄漏风险。统计表保存在 checkpoint 目录的 `feature_stats.pkl` 中，推理时必须加载同一份统计表。
+训练样本使用 leave-one-out 调整，降低标签泄漏风险。统计表保存在 checkpoint 目录的 `feature_stats.pkl` 中，推理时必须加载同一份统计表。该组由于存在隐藏测试集分布漂移和 target encoding 过拟合风险，当前默认不启用。
 
 ### 3. `pair` 匹配特征
 
-已实现但默认关闭。启用方式：
+当前默认启用。默认配置：
 
 ```bash
---engineered_feature_groups time,item,pair
+--engineered_feature_groups time,pair
+--pair_recent_steps 20
+--pair_seq_fids "seq_a:38,seq_b:69,seq_c:47,seq_d:23"
+--pair_candidate_fids "item_id,11"
 ```
 
-pair 特征会计算候选 item 信息与用户最近历史序列的命中关系，包括是否命中、命中次数、最近一次命中的时间差。该特征较重，线上真实数据下可能增加训练和推理耗时，因此当前默认不启用。
+pair 特征会计算候选 item 信息与用户最近历史序列的命中关系，包括是否命中、命中次数、最近一次命中的时间差。当前只匹配 schema 分析中较像 ID 的序列通道，避免全量 sideinfo 跨字段伪命中。
+
+### 4. Dense 异质分组投影
+
+`model.py` 中的 `DenseGroupFusion` 会把 `user_dense_feats` 按来源切分为多个组，每组独立 `Linear + LayerNorm + SiLU`，再用门控融合成 1 个 dense token。这样不增加 NS token 数，不破坏 `d_model % T`。
 
 ## 训练/推理一致性要求
 
@@ -152,7 +167,7 @@ pair 特征会计算候选 item 信息与用户最近历史序列的命中关系
 - `dataset.py` 中工程特征构造逻辑
 - `model.py` 中模型结构和默认参数解释
 
-尤其要注意：`feature_stats.pkl` 是训练阶段从训练集构建出的 item 统计表。推理阶段无法重新得到完整训练集统计，因此必须从 checkpoint 加载，才能保证 item 统计特征的含义和维度与训练阶段一致。
+尤其要注意：`feature_stats.pkl` 是训练阶段从训练集构建出的 item 统计表。只有显式启用 `item` 组时才会生成和加载；推理阶段无法重新得到完整训练集统计，因此启用 item 组时必须从 checkpoint 加载，才能保证 item 统计特征的含义和维度与训练阶段一致。
 
 ## 平台约束
 
@@ -175,8 +190,8 @@ pair 特征会计算候选 item 信息与用户最近历史序列的命中关系
 ## 效率与风险记录
 
 - 线上 baseline 约每个 epoch 1 小时，工程特征不能无限增加维度。
-- 当前默认只启用 `time,item`，约新增 97 维 dense 特征。
-- `pair` 特征默认关闭，主要是为了控制训练和 30 分钟推理时间。
+- 当前默认只启用 `time,pair`，约新增 71 维工程 dense 特征。
+- `pair` 特征只使用白名单序列 fid 和最近 20 步窗口，主要是为了控制训练和 30 分钟推理时间。
 - 曾遇到线上 `torch.compile` / inductor 编译阶段 CUDA OOM，因此当前默认 eager 模式；如需尝试编译，必须显式传 `--compile_model`。
 - `feature_stats.pkl` 不应提交到 git，它属于训练产物，已在 `.gitignore` 中忽略。
 - `model.pt`、`*.pth`、`*.ckpt`、`ckpt/`、`events/`、`logs/` 等训练产物也已忽略。
@@ -207,7 +222,7 @@ bash run.sh
 bash run.sh --no_engineered_features
 ```
 
-启用 pair 特征：
+显式启用 item 统计特征：
 
 ```bash
 bash run.sh --engineered_feature_groups time,item,pair
