@@ -12,6 +12,7 @@
 - 启用 item 组时推理阶段加载同一份 `feature_stats.pkl`，避免训练/推理特征语义不一致
 - `DenseGroupFusion` 会按 raw dense、time、pair、item 组分别投影后门控融合
 - 默认关闭 `torch.compile`，规避线上平台 inductor 编译阶段 CUDA OOM 风险
+- 该版本线上效果相较 baseline 有明显提升，经验复盘见 `doc/feature_engineering_v2_lessons.md`
 
 一句话概括：**这是一个在原 PCVRHyFormer baseline 上追加增强时间特征、语义白名单 pair 特征和异质 dense 分组投影，并保持线上训练/推理格式兼容的版本。**
 
@@ -202,11 +203,12 @@ pair 特征会计算候选 item 信息与用户最近历史序列的命中关系
 
 1. `data_sample_1000/README.md`：先了解数据列结构。
 2. `doc/reading_index_from_demo1000.md`：查看已有文档索引。
-3. `dataset.py`：理解 parquet 到 batch 的转换，以及工程特征追加逻辑。
-4. `train.py`：理解训练入口、参数、环境变量和模型组装。
-5. `model.py`：理解 `ModelInput -> logits` 的前向链路。
-6. `trainer.py`：理解训练 step、验证、checkpoint 保存。
-7. `Model Evaluation/infer.py`：理解线上推理如何恢复训练配置并输出 `predictions.json`。
+3. `doc/feature_engineering_v2_lessons.md`：理解当前有效特征工程的经验、原理和后续改动原则。
+4. `dataset.py`：理解 parquet 到 batch 的转换，以及工程特征追加逻辑。
+5. `train.py`：理解训练入口、参数、环境变量和模型组装。
+6. `model.py`：理解 `ModelInput -> logits` 的前向链路。
+7. `trainer.py`：理解训练 step、验证、checkpoint 保存。
+8. `Model Evaluation/infer.py`：理解线上推理如何恢复训练配置并输出 `predictions.json`。
 
 ## 常用命令
 
