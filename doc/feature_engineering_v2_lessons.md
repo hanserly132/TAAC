@@ -22,6 +22,103 @@ baseline_v1 + time,pair 工程特征 + DenseGroupFusion
 
 核心经验是一句话：**不要把所有可构造特征都堆进去，而是基于字段语义做少量高置信特征，再用异质 dense 投影让模型更容易吸收这些信号。**
 
+## 重要外部参考：特征 Schema 页面
+
+后续继续改特征时，优先参考这个页面：
+
+```text
+https://puiching-memory.github.io/TAAC_2026/analysis/feature-schema/
+```
+
+该页面的价值不是替代本项目代码里的 `schema.json`，而是帮助理解字段语义、基数规模和 train/eval/demo/infer 之间的 schema 差异。当前 v2 特征工程里的 pair 白名单、dense 分组和时间字段处理，都参考了这个页面。
+
+### 1. 先区分声明式 schema 与观测 schema
+
+页面强调 schema 有两类：
+
+- 声明式 schema：原始 `schema.json`，描述列布局、FID、词表上界和 multi-hot 维度，是训练/评估/推理加载数据时首先读取的 schema。
+- 观测 schema：从真实 parquet 切片统计得到的 sidecar，形状与 `schema.json` 一致，但基数与 multi-hot 维度来自当前数据切片。
+
+这意味着后续做特征选择时要注意：
+
+- 不要只根据 demo_1000 的分布判断真实数据字段强弱。
+- 不要把训练日志里的单行 schema payload 当作 train/eval 各自的观测统计。
+- 若后续引入依赖基数、multi-hot 长度或字段覆盖率的规则，应优先看 split-specific observed schema sidecar。
+
+### 2. 当前 pair 白名单的 schema 依据
+
+当前 pair 默认只匹配：
+
+```text
+seq_a:38
+seq_b:69
+seq_c:47
+seq_d:23
+```
+
+这些字段的共同点是：在 schema 参考页中都表现为高基数、ID-like 的序列字段，更适合与候选侧 ID-like 信息做匹配。
+
+候选侧使用：
+
+```text
+item_id
+item_int_feats_11
+```
+
+其中 `item_int_feats_11` 在参考页中是高基数 multi-hot 物品 ID 类特征，因此当前实现会使用它的所有有效 multi-hot 值，而不是只取第一位。
+
+这个依据很关键：pair 特征不是“任意字段数值相等就匹配”，而是“只在语义上可能共享 ID 空间的字段之间匹配”。后续如果要扩展 pair 字段，也应先用 schema 页面确认字段基数和语义，再小步实验。
+
+### 3. 当前 DenseGroupFusion 的 schema 依据
+
+schema 参考页将 `user_dense` 字段列为：
+
+```text
+61, 62, 63, 64, 65, 66, 87, 89, 90, 91
+```
+
+其中 `61` 和 `87` 被标注为预训练 embedding 向量；其余 dense 字段更像统计、稠密或序列聚合特征。当前分组为：
+
+```text
+pretrain_dense: 61,87
+stat_dense: 62,63,64,65,66,89,90,91
+time_engineered
+pair_engineered
+item_engineered
+```
+
+这个分组不是为了增加模型复杂度，而是为了让不同来源、不同尺度、不同语义的 dense 特征先各自投影，再门控融合。后续新增 dense 特征时，也应先判断它属于哪一类，而不是直接混入一个大 dense 向量里。
+
+### 4. 当前时间特征的 schema 依据
+
+schema 参考页给出了四个序列域的时间戳 FID：
+
+```text
+seq_a timestamp fid: 39
+seq_b timestamp fid: 67
+seq_c timestamp fid: 27
+seq_d timestamp fid: 26
+```
+
+因此时间特征应按序列域分别计算，而不是把四个域的时间戳混成一条序列。当前实现对每个域分别计算长度、recency、span、gap 和窗口计数，再追加样本级 hour/dow/周末/深夜特征。
+
+页面还提示不同数据集切片中的时间戳统计可能不同，所以后续做时间相关实验时要重点防守异常时间戳：
+
+```text
+0 < seq_ts <= timestamp
+```
+
+这个过滤条件应保留，除非后续有更明确的时间戳清洗策略。
+
+### 5. 后续使用 schema 页的原则
+
+- 先看字段语义，再看基数，不要只因为基数高就加入特征。
+- pair 只在候选侧和序列侧可能共享 ID 空间时使用。
+- multi-hot 字段要确认是“多值语义”，不要默认只取第一位。
+- dense 新特征要按来源分组，优先复用 `DenseGroupFusion`。
+- train/eval/infer 的 schema 可能存在差异，依赖字段覆盖率的实验要小步验证。
+- 页面是辅助判断，最终仍以平台真实训练和推理代码可复现为准。
+
 ## 为什么这版有效
 
 ### 1. 时间特征补足了序列模型不容易直接学稳的全局时间统计
