@@ -3,7 +3,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
 python3 -u "${SCRIPT_DIR}/train.py" \
-    --ns_tokenizer_type rankmixer \
+    --ns_tokenizer_type semantic_rankmixer \
     --user_ns_tokens 5 \
     --item_ns_tokens 2 \
     --num_queries 2 \
@@ -16,6 +16,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --pair_recent_steps 20 \
     --pair_seq_fids "seq_a:38,seq_b:69,seq_c:47,seq_d:23" \
     --pair_candidate_fids "item_id,11" \
-    --dense_projection_mode group_fusion \
+    --dense_projection_mode ue_separated_fusion \
+    --use_din \
+    --din_seq_recent_steps 50 \
     --seq_max_lens "seq_a:512,seq_b:512,seq_c:1024,seq_d:1024" \
     "$@"

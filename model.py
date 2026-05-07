@@ -1190,6 +1190,108 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class SemanticRankMixerNSTokenizer(nn.Module):
+    """Semantic NS tokenizer with fixed token count.
+
+    It first builds one embedding vector per configured semantic group, then
+    assigns groups to a fixed number of NS tokens in round-robin order. This
+    keeps the tunable token count from RankMixer while avoiding arbitrary
+    equal-width cuts through concatenated field embeddings.
+    """
+
+    def __init__(
+        self,
+        feature_specs: List[Tuple[int, int, int]],
+        groups: List[List[int]],
+        emb_dim: int,
+        d_model: int,
+        num_ns_tokens: int,
+        emb_skip_threshold: int = 0,
+    ) -> None:
+        super().__init__()
+        self.feature_specs = feature_specs
+        self.groups = groups
+        self.emb_dim = emb_dim
+        self.num_ns_tokens = max(1, int(num_ns_tokens))
+        self.emb_skip_threshold = emb_skip_threshold
+
+        embs = []
+        for vs, _, _ in feature_specs:
+            skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+            if skip:
+                embs.append(None)
+            else:
+                embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+        self.embs = nn.ModuleList([e for e in embs if e is not None])
+        self._emb_index = []
+        real_idx = 0
+        for e in embs:
+            if e is not None:
+                self._emb_index.append(real_idx)
+                real_idx += 1
+            else:
+                self._emb_index.append(-1)
+
+        self.group_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(emb_dim, emb_dim),
+                nn.LayerNorm(emb_dim),
+                nn.SiLU(),
+            )
+            for _ in groups
+        ])
+        self.token_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(emb_dim, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+            )
+            for _ in range(self.num_ns_tokens)
+        ])
+
+        self._token_group_indices: List[List[int]] = [[] for _ in range(self.num_ns_tokens)]
+        for group_idx in range(len(groups)):
+            self._token_group_indices[group_idx % self.num_ns_tokens].append(group_idx)
+
+        logging.info(
+            f"SemanticRankMixerNSTokenizer: {len(groups)} groups, "
+            f"num_ns_tokens={self.num_ns_tokens}, emb_dim={emb_dim}"
+        )
+
+    def _embed_fid(self, int_feats: torch.Tensor, fid_idx: int) -> torch.Tensor:
+        vs, offset, length = self.feature_specs[fid_idx]
+        emb_real_idx = self._emb_index[fid_idx]
+        if emb_real_idx == -1:
+            return int_feats.new_zeros(int_feats.shape[0], self.emb_dim, dtype=torch.float)
+        emb_layer = self.embs[emb_real_idx]
+        if length == 1:
+            return emb_layer(int_feats[:, offset].long())
+        vals = int_feats[:, offset:offset + length].long()
+        emb_all = emb_layer(vals)
+        mask = (vals != 0).float().unsqueeze(-1)
+        count = mask.sum(dim=1).clamp(min=1)
+        return (emb_all * mask).sum(dim=1) / count
+
+    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+        group_embs = []
+        for group, proj in zip(self.groups, self.group_projs):
+            fid_embs = [self._embed_fid(int_feats, fid_idx) for fid_idx in group]
+            if fid_embs:
+                group_emb = torch.stack(fid_embs, dim=1).mean(dim=1)
+            else:
+                group_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim, dtype=torch.float)
+            group_embs.append(proj(group_emb))
+
+        tokens = []
+        for token_idx, group_indices in enumerate(self._token_group_indices):
+            if group_indices:
+                token_emb = torch.stack([group_embs[i] for i in group_indices], dim=1).mean(dim=1)
+            else:
+                token_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim, dtype=torch.float)
+            tokens.append(self.token_projs[token_idx](token_emb).unsqueeze(1))
+        return torch.cat(tokens, dim=1)
+
+
 class DenseGroupFusion(nn.Module):
     """Projects heterogeneous dense feature groups separately and fuses them.
 
@@ -1260,6 +1362,163 @@ class DenseGroupFusion(nn.Module):
         return self.out_norm(fused)
 
 
+class UESeparatedDenseFusion(nn.Module):
+    """Separates UE dense features from auxiliary dense groups.
+
+    The module returns a dense token for the HyFormer NS stream plus separate
+    UE and auxiliary tokens for the final MLP / DIN fusion path.
+    """
+
+    def __init__(
+        self,
+        total_dim: int,
+        group_indices: Optional[Dict[str, List[int]]],
+        d_model: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.total_dim = int(total_dim)
+        group_indices = group_indices or {'all_dense': list(range(total_dim))}
+
+        ue_indices: List[int] = []
+        aux_groups: Dict[str, List[int]] = {}
+        for name, indices in group_indices.items():
+            clean = sorted({int(i) for i in indices if 0 <= int(i) < total_dim})
+            if not clean:
+                continue
+            if name == 'pretrain_dense':
+                ue_indices.extend(clean)
+            else:
+                aux_groups[name] = clean
+
+        if not ue_indices:
+            ue_indices = []
+        if not aux_groups:
+            aux_groups = {'aux_dense': [i for i in range(total_dim) if i not in set(ue_indices)]}
+        if not any(aux_groups.values()):
+            aux_groups = {'aux_dense': list(range(total_dim))}
+
+        self.has_ue = bool(ue_indices)
+        if self.has_ue:
+            self.register_buffer('_ue_idx', torch.tensor(ue_indices, dtype=torch.long), persistent=False)
+            self.ue_proj = nn.Sequential(
+                nn.Linear(len(ue_indices), d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.ue_proj = None
+
+        self.aux_fusion = DenseGroupFusion(
+            total_dim=total_dim,
+            group_indices=aux_groups,
+            d_model=d_model,
+            dropout=dropout,
+        )
+        self.ns_gate = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, 2),
+        )
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        dense_feats: torch.Tensor,
+        user_ns: Optional[torch.Tensor] = None,
+        item_ns: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        aux_token = self.aux_fusion(dense_feats)
+        if self.has_ue:
+            ue_idx = self._ue_idx.to(dense_feats.device)
+            ue_token = self.ue_proj(dense_feats.index_select(dim=1, index=ue_idx))
+        else:
+            ue_token = torch.zeros_like(aux_token)
+
+        context_parts = []
+        if user_ns is not None:
+            context_parts.append(user_ns.mean(dim=1))
+        if item_ns is not None:
+            context_parts.append(item_ns.mean(dim=1))
+        if context_parts:
+            context = torch.stack(context_parts, dim=1).mean(dim=1)
+            aux_token = self.out_norm(aux_token + 0.1 * context)
+
+        gate_logits = self.ns_gate(torch.cat([ue_token, aux_token], dim=-1))
+        gate = torch.softmax(gate_logits, dim=-1)
+        dense_token = gate[:, :1] * ue_token + gate[:, 1:] * aux_token
+        return self.out_norm(dense_token), ue_token, aux_token
+
+
+class LightDINInterest(nn.Module):
+    """Lightweight DIN-style target attention over sequence tokens."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_sequences: int,
+        hidden_mult: int = 2,
+        dropout: float = 0.01,
+        recent_steps: int = 50,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_sequences = num_sequences
+        self.recent_steps = max(1, int(recent_steps))
+        hidden_dim = max(d_model, int(hidden_mult) * d_model)
+        self.query_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.SiLU(),
+        )
+        self.attn_mlp = nn.Sequential(
+            nn.Linear(4 * d_model, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.domain_gate = nn.Sequential(
+            nn.Linear(num_sequences * d_model, max(d_model, num_sequences * d_model // 2)),
+            nn.SiLU(),
+            nn.Linear(max(d_model, num_sequences * d_model // 2), num_sequences),
+        )
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def _take_recent(
+        self,
+        seq_tokens: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if seq_tokens.shape[1] <= self.recent_steps:
+            return seq_tokens, padding_mask
+        return seq_tokens[:, -self.recent_steps:, :], padding_mask[:, -self.recent_steps:]
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        seq_tokens_list: List[torch.Tensor],
+        seq_masks_list: List[torch.Tensor],
+    ) -> torch.Tensor:
+        query = self.query_proj(query)
+        domain_vectors = []
+        for seq_tokens, mask in zip(seq_tokens_list, seq_masks_list):
+            seq_tokens, mask = self._take_recent(seq_tokens, mask)
+            q = query.unsqueeze(1).expand_as(seq_tokens)
+            attn_in = torch.cat([q, seq_tokens, q - seq_tokens, q * seq_tokens], dim=-1)
+            scores = self.attn_mlp(attn_in).squeeze(-1)
+            scores = scores.masked_fill(mask, -1e4)
+            weights = torch.softmax(scores, dim=-1)
+            weights = weights * (~mask).float()
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            domain_vectors.append((seq_tokens * weights.unsqueeze(-1)).sum(dim=1))
+
+        stacked = torch.stack(domain_vectors, dim=1)
+        gate_logits = self.domain_gate(torch.cat(domain_vectors, dim=-1))
+        gate = torch.softmax(gate_logits, dim=-1).unsqueeze(-1)
+        return self.out_norm((stacked * gate).sum(dim=1))
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1302,6 +1561,10 @@ class PCVRHyFormer(nn.Module):
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
         dense_projection_mode: str = 'group_fusion',
+        use_din: bool = True,
+        din_hidden_mult: int = 2,
+        din_dropout: float = 0.01,
+        din_seq_recent_steps: int = 50,
     ) -> None:
         super().__init__()
 
@@ -1318,6 +1581,8 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.dense_projection_mode = dense_projection_mode
+        self.use_din = bool(use_din)
+        self.din_seq_recent_steps = int(din_seq_recent_steps)
 
         # ================== NS Tokens Construction ==================
 
@@ -1366,6 +1631,30 @@ class PCVRHyFormer(nn.Module):
                 emb_skip_threshold=emb_skip_threshold,
             )
             num_item_ns = item_ns_tokens
+        elif ns_tokenizer_type == 'semantic_rankmixer':
+            if user_ns_tokens <= 0:
+                user_ns_tokens = len(user_ns_groups)
+            if item_ns_tokens <= 0:
+                item_ns_tokens = len(item_ns_groups)
+            self.user_ns_tokenizer = SemanticRankMixerNSTokenizer(
+                feature_specs=user_int_feature_specs,
+                groups=user_ns_groups,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                num_ns_tokens=user_ns_tokens,
+                emb_skip_threshold=emb_skip_threshold,
+            )
+            num_user_ns = user_ns_tokens
+
+            self.item_ns_tokenizer = SemanticRankMixerNSTokenizer(
+                feature_specs=item_int_feature_specs,
+                groups=item_ns_groups,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                num_ns_tokens=item_ns_tokens,
+                emb_skip_threshold=emb_skip_threshold,
+            )
+            num_item_ns = item_ns_tokens
         else:
             raise ValueError(f"Unknown ns_tokenizer_type: {ns_tokenizer_type}")
 
@@ -1374,6 +1663,13 @@ class PCVRHyFormer(nn.Module):
         if self.has_user_dense:
             if dense_projection_mode == 'group_fusion':
                 self.user_dense_proj = DenseGroupFusion(
+                    total_dim=user_dense_dim,
+                    group_indices=user_dense_group_indices,
+                    d_model=d_model,
+                    dropout=dropout_rate,
+                )
+            elif dense_projection_mode == 'ue_separated_fusion':
+                self.user_dense_proj = UESeparatedDenseFusion(
                     total_dim=user_dense_dim,
                     group_indices=user_dense_group_indices,
                     d_model=d_model,
@@ -1496,6 +1792,17 @@ class PCVRHyFormer(nn.Module):
         else:
             self.rotary_emb = None
 
+        if self.use_din:
+            self.din = LightDINInterest(
+                d_model=d_model,
+                num_sequences=self.num_sequences,
+                hidden_mult=din_hidden_mult,
+                dropout=din_dropout,
+                recent_steps=din_seq_recent_steps,
+            )
+        else:
+            self.din = None
+
         # Output projection
         self.output_proj = nn.Sequential(
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
@@ -1507,11 +1814,11 @@ class PCVRHyFormer(nn.Module):
 
         # Classifier
         self.clsfier = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
+            nn.Linear(4 * d_model, 2 * d_model),
+            nn.LayerNorm(2 * d_model),
             nn.SiLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(d_model, action_num)
+            nn.Linear(2 * d_model, action_num)
         )
 
         # Initialize parameters
@@ -1727,17 +2034,31 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
-    def forward(self, inputs: ModelInput) -> torch.Tensor:
-        """Runs the forward pass of the PCVRHyFormer model."""
-        # 1. NS tokens: grouped projection
+    def _extract_features(
+        self,
+        inputs: ModelInput,
+        apply_dropout: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Builds the final MLP input and HyFormer output embedding."""
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
+        zero_token = user_ns.new_zeros(user_ns.shape[0], self.d_model)
+        user_ue_token = zero_token
+        aux_dense_token = zero_token
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = self.user_dense_proj(inputs.user_dense_feats)
-            if self.dense_projection_mode == 'single':
-                user_dense_tok = F.silu(user_dense_tok)
+            if self.dense_projection_mode == 'ue_separated_fusion':
+                user_dense_tok, user_ue_token, aux_dense_token = self.user_dense_proj(
+                    inputs.user_dense_feats,
+                    user_ns=user_ns,
+                    item_ns=item_ns,
+                )
+            else:
+                user_dense_tok = self.user_dense_proj(inputs.user_dense_feats)
+                if self.dense_projection_mode == 'single':
+                    user_dense_tok = F.silu(user_dense_tok)
+                aux_dense_token = user_dense_tok
             user_dense_tok = user_dense_tok.unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
@@ -1747,7 +2068,6 @@ class PCVRHyFormer(nn.Module):
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
-        # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
@@ -1760,57 +2080,30 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=self.training
+            apply_dropout=apply_dropout,
         )
+        if self.din is not None:
+            din_query = item_ns.mean(dim=1)
+            din_token = self.din(din_query, seq_tokens_list, seq_masks_list)
+        else:
+            din_token = zero_token
 
-        # 5. Classifier
-        logits = self.clsfier(output)  # (B, action_num)
+        final_input = torch.cat([output, din_token, user_ue_token, aux_dense_token], dim=-1)
+        return final_input, output
+
+    def forward(self, inputs: ModelInput) -> torch.Tensor:
+        """Runs the forward pass of the PCVRHyFormer model."""
+        final_input, _ = self._extract_features(inputs, apply_dropout=self.training)
+
+        logits = self.clsfier(final_input)  # (B, action_num)
         return logits
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
-        # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
-
-        ns_parts = [user_ns]
-        if self.has_user_dense:
-            user_dense_tok = self.user_dense_proj(inputs.user_dense_feats)
-            if self.dense_projection_mode == 'single':
-                user_dense_tok = F.silu(user_dense_tok)
-            user_dense_tok = user_dense_tok.unsqueeze(1)
-            ns_parts.append(user_dense_tok)
-        ns_parts.append(item_ns)
-        if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
-            ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)
-
-        seq_tokens_list = []
-        seq_masks_list = []
-        for domain in self.seq_domains:
-            tokens = self._embed_seq_domain(
-                inputs.seq_data[domain],
-                self._seq_embs[domain], self._seq_proj[domain],
-                self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
-            seq_tokens_list.append(tokens)
-            mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
-            seq_masks_list.append(mask)
-
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
-
-        output = self._run_multi_seq_blocks(
-            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=False
-        )
-
-        logits = self.clsfier(output)
+        final_input, output = self._extract_features(inputs, apply_dropout=False)
+        logits = self.clsfier(final_input)
         return logits, output

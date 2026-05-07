@@ -2,7 +2,7 @@
 
 ## 版本说明
 
-当前版本可视为：**baseline_v1 + 稳健 feature engineering v2 增强版**。
+当前版本可视为：**baseline_v1 + 稳健 feature engineering v3 实验版**。
 
 本仓库最初是 TAAC2026 推荐系统/PCVR 预测任务的 baseline。当前改动重点不是重写模型结构，而是在保持 baseline 训练、推理格式兼容的前提下，增加可控的工程特征：
 
@@ -10,12 +10,15 @@
 - item 侧 target/stat 统计特征保留为可选实验，默认不启用
 - 启用 item 组时训练阶段保存 `feature_stats.pkl`
 - 启用 item 组时推理阶段加载同一份 `feature_stats.pkl`，避免训练/推理特征语义不一致
-- `DenseGroupFusion` 会按 raw dense、time、pair、item 组分别投影后门控融合
+- 默认使用 `semantic_rankmixer`，先按语义 group 得到 embedding，再 round-robin 分配到固定 NS token
+- 默认使用 `ue_separated_fusion`，将 user dense 中的 UE 类特征 `61,87` 与其他 dense 特征分开建模
+- 默认开启轻量 DIN，用候选 item 表示对最近历史序列做 target attention
 - 默认关闭 `torch.compile`，规避线上平台 inductor 编译阶段 CUDA OOM 风险
-- 该版本线上效果相较 baseline 有明显提升，经验复盘见 `doc/feature_engineering_v2_lessons.md`
+- v2 版本 `time,pair + DenseGroupFusion` 线上效果相较 baseline 有明显提升，经验复盘见 `doc/feature_engineering_v2_lessons.md`
+- v3 模型侧改动说明见 `modeling_v3_changes.md`
 - 后续改特征时应同步参考外部 schema 页面：`https://puiching-memory.github.io/TAAC_2026/analysis/feature-schema/`
 
-一句话概括：**这是一个在原 PCVRHyFormer baseline 上追加增强时间特征、语义白名单 pair 特征和异质 dense 分组投影，并保持线上训练/推理格式兼容的版本。**
+一句话概括：**这是一个在 v2 强基线上继续加入语义 tokenization、UE 分离 dense 建模和轻量 DIN 候选-历史兴趣建模，并保持线上训练/推理格式兼容的实验版本。**
 
 ## 项目目标
 
@@ -38,7 +41,7 @@
 - `run.sh`
   - 线上训练任务的强制入口。
   - 设置 `PYTHONPATH` 后调用 `train.py`。
-  - 当前默认参数包含 `rankmixer` NS tokenizer、`num_epochs=10`、`batch_size=512`、`seq_max_lens="seq_a:512,seq_b:512,seq_c:1024,seq_d:1024"`。
+  - 当前默认参数包含 `semantic_rankmixer`、`ue_separated_fusion`、`use_din`、`num_epochs=10`、`batch_size=512`、`seq_max_lens="seq_a:512,seq_b:512,seq_c:1024,seq_d:1024"`。
 
 - `train.py`
   - 训练主控脚本，负责读取平台环境变量、构建 dataloader、构建模型、初始化 trainer。
@@ -50,7 +53,9 @@
     - `--pair_recent_steps`，默认 `20`
     - `--pair_seq_fids`，默认 `seq_a:38,seq_b:69,seq_c:47,seq_d:23`
     - `--pair_candidate_fids`，默认 `item_id,11`
-    - `--dense_projection_mode`，默认 `group_fusion`
+    - `--dense_projection_mode`，默认 `ue_separated_fusion`
+    - `--use_din` / `--no_din`，默认开启
+    - `--din_seq_recent_steps`，默认 `50`
   - `--compile_model` 默认关闭；只有显式传入才启用 `torch.compile`。
 
 - `dataset.py`
@@ -78,9 +83,10 @@
     - MultiSeqQueryGenerator
     - MultiSeqHyFormerBlock
     - RankMixerBlock
-    - DenseGroupFusion
+    - DenseGroupFusion / UESeparatedDenseFusion
+    - LightDINInterest
     - 最终 MLP 输出 logits
-  - 当前默认 NS tokenizer 使用 `rankmixer`，可降低 NS token 数量，控制 `d_model % T` 约束。
+  - 当前默认 NS tokenizer 使用 `semantic_rankmixer`，保留固定 NS token 数，同时避免等长切块切断语义 group。
 
 - `trainer.py`
   - 训练循环、验证、early stopping、checkpoint 保存。
@@ -158,6 +164,22 @@ pair 特征会计算候选 item 信息与用户最近历史序列的命中关系
 
 `model.py` 中的 `DenseGroupFusion` 会把 `user_dense_feats` 按来源切分为多个组，每组独立 `Linear + LayerNorm + SiLU`，再用门控融合成 1 个 dense token。这样不增加 NS token 数，不破坏 `d_model % T`。
 
+### 5. v3 Tokenization / UE 分离 / DIN
+
+当前默认实验配置：
+
+```bash
+--ns_tokenizer_type semantic_rankmixer
+--dense_projection_mode ue_separated_fusion
+--use_din
+--din_seq_recent_steps 50
+```
+
+- `semantic_rankmixer`：先按 NS group 得到语义 group embedding，再 round-robin 分配到固定数量 NS token，避免原 `rankmixer` 等长切块切断字段语义。
+- `ue_separated_fusion`：将 `pretrain_dense` 中的 UE 特征 `61,87` 单独投影为 `user_ue_token`，其他 dense group 融合为 `aux_dense_token`；HyFormer 主干仍只接收 1 个 dense NS token，避免破坏 `d_model % T`。
+- `LightDINInterest`：使用 item NS mean pooling 作为 query，对四个序列域最近 50 步 token 做 DIN-style target attention，并与 HyFormer 输出、UE token、aux token 拼接后进入最终 MLP。
+- v2 回退配置为：`--ns_tokenizer_type rankmixer --dense_projection_mode group_fusion --no_din`。
+
 ## 训练/推理一致性要求
 
 本项目训练和推理阶段是分开的，因此下列文件/配置必须保持一致：
@@ -194,6 +216,7 @@ pair 特征会计算候选 item 信息与用户最近历史序列的命中关系
 - 线上 baseline 约每个 epoch 1 小时，工程特征不能无限增加维度。
 - 当前默认只启用 `time,pair`，约新增 71 维工程 dense 特征。
 - `pair` 特征只使用白名单序列 fid 和最近 20 步窗口，主要是为了控制训练和 30 分钟推理时间。
+- DIN 只看最近 50 步序列 token，避免对 512/1024 长序列额外做完整 target attention。
 - 曾遇到线上 `torch.compile` / inductor 编译阶段 CUDA OOM，因此当前默认 eager 模式；如需尝试编译，必须显式传 `--compile_model`。
 - `feature_stats.pkl` 不应提交到 git，它属于训练产物，已在 `.gitignore` 中忽略。
 - `model.pt`、`*.pth`、`*.ckpt`、`ckpt/`、`events/`、`logs/` 等训练产物也已忽略。
@@ -206,11 +229,12 @@ pair 特征会计算候选 item 信息与用户最近历史序列的命中关系
 2. `doc/reading_index_from_demo1000.md`：查看已有文档索引。
 3. `https://puiching-memory.github.io/TAAC_2026/analysis/feature-schema/`：查看字段语义、基数、multi-hot 维度和 train/eval/demo/infer schema 差异。
 4. `doc/feature_engineering_v2_lessons.md`：理解当前有效特征工程的经验、原理和后续改动原则。
-5. `dataset.py`：理解 parquet 到 batch 的转换，以及工程特征追加逻辑。
-6. `train.py`：理解训练入口、参数、环境变量和模型组装。
-7. `model.py`：理解 `ModelInput -> logits` 的前向链路。
-8. `trainer.py`：理解训练 step、验证、checkpoint 保存。
-9. `Model Evaluation/infer.py`：理解线上推理如何恢复训练配置并输出 `predictions.json`。
+5. `modeling_v3_changes.md`：理解 v3 tokenization、UE 分离和轻量 DIN 改动。
+6. `dataset.py`：理解 parquet 到 batch 的转换，以及工程特征追加逻辑。
+7. `train.py`：理解训练入口、参数、环境变量和模型组装。
+8. `model.py`：理解 `ModelInput -> logits` 的前向链路。
+9. `trainer.py`：理解训练 step、验证、checkpoint 保存。
+10. `Model Evaluation/infer.py`：理解线上推理如何恢复训练配置并输出 `predictions.json`。
 
 ## 常用命令
 

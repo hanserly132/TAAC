@@ -157,11 +157,23 @@ def parse_args() -> argparse.Namespace:
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
                         help='RoPE base frequency (default 10000)')
-    parser.add_argument('--dense_projection_mode', type=str, default='group_fusion',
-                        choices=['group_fusion', 'single'],
+    parser.add_argument('--dense_projection_mode', type=str, default='ue_separated_fusion',
+                        choices=['group_fusion', 'ue_separated_fusion', 'single'],
                         help='How user_dense_feats are projected: group_fusion splits '
                              'heterogeneous raw/time/pair/item dense groups before fusing '
-                             'to one token; single keeps the old one-layer projection.')
+                             'to one token; ue_separated_fusion keeps UE dense separate '
+                             'for the final MLP while preserving one dense NS token; '
+                             'single keeps the old one-layer projection.')
+    parser.add_argument('--use_din', action='store_true', default=True,
+                        help='Enable lightweight DIN target attention over recent sequence tokens.')
+    parser.add_argument('--no_din', dest='use_din', action='store_false',
+                        help='Disable the lightweight DIN branch.')
+    parser.add_argument('--din_hidden_mult', type=int, default=2,
+                        help='Hidden multiplier for the lightweight DIN attention MLP.')
+    parser.add_argument('--din_dropout', type=float, default=0.01,
+                        help='Dropout rate inside the lightweight DIN branch.')
+    parser.add_argument('--din_seq_recent_steps', type=int, default=50,
+                        help='Number of recent sequence tokens consumed by lightweight DIN.')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -210,12 +222,14 @@ def parse_args() -> argparse.Namespace:
                              'each feature is placed in its own singleton group.')
 
     # NS tokenizer variant.
-    parser.add_argument('--ns_tokenizer_type', type=str, default='rankmixer',
-                        choices=['group', 'rankmixer'],
+    parser.add_argument('--ns_tokenizer_type', type=str, default='semantic_rankmixer',
+                        choices=['group', 'rankmixer', 'semantic_rankmixer'],
                         help='NS tokenizer variant: '
                              'group = project each group to one token, '
                              'rankmixer = concatenate all embeddings then split into '
-                             'equal-size chunks (token count is tunable)')
+                             'equal-size chunks (token count is tunable), '
+                             'semantic_rankmixer = build semantic group embeddings '
+                             'then round-robin assign groups to fixed NS tokens')
     parser.add_argument('--user_ns_tokens', type=int, default=0,
                         help='Number of user NS tokens in rankmixer mode '
                              '(0 = automatically use the number of user groups)')
@@ -351,6 +365,10 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "dense_projection_mode": args.dense_projection_mode,
+        "use_din": args.use_din,
+        "din_hidden_mult": args.din_hidden_mult,
+        "din_dropout": args.din_dropout,
+        "din_seq_recent_steps": args.din_seq_recent_steps,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -363,7 +381,11 @@ def main() -> None:
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
     T = args.num_queries * num_sequences + num_ns
-    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
+    logging.info(
+        f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, "
+        f"rank_mixer_mode={args.rank_mixer_mode}, ns_tokenizer_type={args.ns_tokenizer_type}, "
+        f"dense_projection_mode={args.dense_projection_mode}, use_din={args.use_din}"
+    )
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())

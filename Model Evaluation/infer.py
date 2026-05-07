@@ -66,10 +66,14 @@ _FALLBACK_MODEL_CFG = {
     'rope_base': 10000.0,
     'emb_skip_threshold': 0,
     'seq_id_threshold': 10000,
-    'ns_tokenizer_type': 'rankmixer',
+    'ns_tokenizer_type': 'semantic_rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
-    'dense_projection_mode': 'group_fusion',
+    'dense_projection_mode': 'ue_separated_fusion',
+    'use_din': True,
+    'din_hidden_mult': 2,
+    'din_dropout': 0.01,
+    'din_seq_recent_steps': 50,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
